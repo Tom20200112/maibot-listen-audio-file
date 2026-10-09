@@ -104,6 +104,7 @@ class AudioRecord:
     file_id: str = ""
     local_path: str = ""
     kind: str = "file"  # file＝音频文件；voice＝语音条
+    confirmed: bool = False  # 音频文件：QQ 端确认过是真文件（url、file_id 才可信）
 
     @property
     def label(self) -> str:
@@ -193,7 +194,7 @@ class ListenAudioFilePlugin(MaiBotPlugin):
         rec = AudioRecord(
             msg_id=str(message.get("message_id") or ""),
             name=m.group("name"),
-            url=m.group("url") or "",
+            url="",  # 聊天文字里的链接谁都能手打，一律不用；只用 QQ 端原消息里的
             sender=str(user.get("user_cardname") or user.get("user_nickname") or user.get("user_id") or "对方"),
             ts=time.time(),
             stream_id=str(message.get("session_id") or ""),
@@ -202,8 +203,9 @@ class ListenAudioFilePlugin(MaiBotPlugin):
         if not await self._confirm_on_qq(rec):
             return
         self._remember(rec)
-        logger.info(f"[听音频文件] 记下 {rec.sender} 发的「{rec.name}」 msg_id={rec.msg_id}")
-        if self.config.listen.cache_on_arrival:
+        logger.info(f"[听音频文件] 记下 {rec.sender} 发的「{rec.name}」 msg_id={rec.msg_id}"
+                    + ("" if rec.confirmed else "（QQ 端暂时确认不了，先不预存，要听时再确认）"))
+        if self.config.listen.cache_on_arrival and rec.url:
             await self._save_copy(rec)
 
     def _remember(self, rec: AudioRecord) -> None:
@@ -265,7 +267,7 @@ class ListenAudioFilePlugin(MaiBotPlugin):
         """到 QQ 端查原消息，看它是不是真的文件消息。
 
         返回 (是不是真文件, file_id, 原消息里的下载链接)。是不是真文件：True 是；False 不是，
-        说明有人在聊天里手打了一行「[文件] …，链接: …」；None 查不了（QQ 端只认最近几小时的消息）。
+        说明有人在聊天里手打了一行「[文件] …，链接: …」；None 查不了（适配器没响应，或 QQ 端只认最近几小时的消息）。
         file_id 用来在链接过期后去群文件重新要地址，所以到达时就查。
         """
         if not MSG_ID_RE.fullmatch(msg_id):
@@ -283,18 +285,29 @@ class ListenAudioFilePlugin(MaiBotPlugin):
                     return True, str(data.get("file_id") or data.get("id") or ""), str(data.get("url") or "")
             return False, "", ""
         if isinstance(segs, str):  # QQ 端设成字符串消息格式时是 CQ 码：NapCat 写 file_id=，SnowLuma 写 id=
-            hit = re.search(r"\[CQ:file,(?:[^\]]*,)?(?:file_id|id)=([^,\]]+)", segs)
-            return (True, html.unescape(hit.group(1)), "") if hit else (False, "", "")
+            hit = re.search(r"\[CQ:file,[^\]]*\]", segs)
+            if not hit:
+                return False, "", ""
+            fid = re.search(r"[,\[](?:file_id|id)=([^,\]]+)", hit.group(0))
+            url = re.search(r",url=([^,\]]+)", hit.group(0))
+            return True, html.unescape(fid.group(1)) if fid else "", html.unescape(url.group(1)) if url else ""
         return None, "", ""
 
     async def _confirm_on_qq(self, rec: AudioRecord) -> bool:
-        """确认 rec 是真的文件消息并补上 file_id；是手打的假文件消息就返回 False。"""
-        real, rec.file_id, real_url = await self._check_on_qq(rec.msg_id)
+        """到 QQ 端确认 rec 是真的文件消息，补上 file_id 和原消息里的下载链接；是手打的假文件消息就返回 False。
+
+        确认不了（适配器没响应、消息太老 QQ 端不认）时返回 True、但 rec.confirmed 留 False，
+        链接和 file_id 都是空的：这时什么都不下载，要听的时候再确认一次（fail-closed）。
+        """
+        real, file_id, real_url = await self._check_on_qq(rec.msg_id)
         if real is False:
             logger.info(f"[听音频文件] msg_id={rec.msg_id} 里的「[文件] …」是聊天文字，不是真文件，不理它")
             return False
-        if real_url.startswith(("http://", "https://")):
-            rec.url = real_url  # 以 QQ 端原消息里的链接为准
+        if real is None:
+            return True
+        rec.confirmed = True
+        rec.file_id = file_id
+        rec.url = real_url if real_url.startswith(("http://", "https://")) else ""
         return True
 
     async def _save_copy(self, rec: AudioRecord) -> None:
@@ -439,7 +452,7 @@ class ListenAudioFilePlugin(MaiBotPlugin):
         if not m or not is_audio_name(m.group("name")):
             return None
         rec = AudioRecord(
-            msg_id=msg_id, name=m.group("name"), url=m.group("url") or "",
+            msg_id=msg_id, name=m.group("name"), url="",  # 文字里的链接不用，见 _confirm_on_qq
             sender=_sender_of(msg), ts=time.time(), stream_id=stream_id, group_id=str(group.get("group_id") or ""),
         )
         if not await self._confirm_on_qq(rec):
@@ -493,11 +506,20 @@ class ListenAudioFilePlugin(MaiBotPlugin):
                     pass
             return await self._refetch_voice(rec)
         errors = []
-        for src in (rec.local_path, rec.url):
-            if not src:
-                continue
+        if rec.local_path:  # 副本是 QQ 端确认过之后才存的（_save_copy 只用确认过的链接）
             try:
-                return await fetch_bytes(src, self._max_bytes, allow_private=self.config.listen.allow_private_network)
+                return await fetch_bytes(rec.local_path, self._max_bytes)
+            except AudioError as exc:
+                errors.append(str(exc))
+        if not rec.confirmed:
+            # 到达时没能到 QQ 端确认：现在再确认一次，确认不了就不下载
+            if not await self._confirm_on_qq(rec):
+                raise AudioError("这条「[文件] …」是聊天里打的字，不是真的文件")
+            if not rec.confirmed:
+                raise AudioError("QQ 端查不到这条原消息（可能发得太久了），确认不了它是真文件，所以没去下载")
+        if rec.url:
+            try:
+                return await fetch_bytes(rec.url, self._max_bytes, allow_private=self.config.listen.allow_private_network)
             except AudioError as exc:
                 errors.append(str(exc))
         # 链接过期了：群文件还在的话重新要一个下载地址

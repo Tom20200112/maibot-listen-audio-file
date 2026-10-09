@@ -164,6 +164,19 @@ def sniff_audio_ext(data: bytes) -> str:
     return ""
 
 
+def is_local_audio_file(path: str) -> bool:
+    """本机路径是不是一个真的音频文件：扩展名在白名单里、文件头也认得出是音频。
+    给「适配器/QQ 端返回的本地路径」把关，免得它返回怪东西时去读本机别的文件。"""
+    path = str(path or "")
+    if not path or not os.path.isfile(path) or not _ext(path):
+        return False
+    try:
+        with open(path, "rb") as f:
+            return bool(sniff_audio_ext(f.read(16)))
+    except OSError:
+        return False
+
+
 def ffmpeg_available() -> bool:
     return shutil.which("ffmpeg") is not None
 

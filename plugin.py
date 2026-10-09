@@ -33,6 +33,7 @@ from .audio_core import (
     ask_model,
     fetch_bytes,
     is_audio_name,
+    is_local_audio_file,
     sniff_audio_ext,
     to_small_mp3,
     to_wav,
@@ -474,7 +475,7 @@ class ListenAudioFilePlugin(MaiBotPlugin):
                 if got.get("base64"):
                     return base64.b64decode(str(got["base64"]))
                 path = str(got.get("file") or "")
-                if path and os.path.isfile(path):
+                if is_local_audio_file(path):  # 只读确实是音频的本地文件
                     return await fetch_bytes(path, self._max_bytes)
         except Exception as exc:
             errors.append(f"适配器取语音失败：{exc}")

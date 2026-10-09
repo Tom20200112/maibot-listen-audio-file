@@ -1,8 +1,8 @@
 {
   "manifest_version": 2,
-  "version": "1.0.2",
+  "version": "1.1.0",
   "name": "听音频文件",
-  "description": "让麦麦能听聊天里发的音频文件（mp3/m4a/wav 等）：听写歌词、点评唱歌、说出内容",
+  "description": "让麦麦能听聊天里的音频文件和语音条（mp3/m4a/wav 等）：听写歌词、点评唱歌、说出内容",
   "author": {
     "name": "Tom",
     "url": "https://github.com/Tom20200112"

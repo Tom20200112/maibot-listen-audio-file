@@ -1,9 +1,10 @@
-"""听音频文件（MaiBot 1.2.x / 1.3.x 插件）：让麦麦能听聊天里别人发的音频文件（mp3/m4a/wav/amr…）。
+"""听音频文件（MaiBot 1.2.x / 1.3.x 插件）：让麦麦能听聊天里别人发的音频文件（mp3/m4a/wav/amr…）和语音条。
 
 QQ 端用 NapCat 或 SnowLuma 都行（MaiBot 官方的 NapCat 适配器、SnowLuma 适配器都支持）。
-适配器把「文件」消息转成一行字「[文件] xx.mp3，大小: …，链接: …」，麦麦看得到但听不到。
+适配器把「文件」消息转成一行字「[文件] xx.mp3，大小: …，链接: …」，麦麦看得到但听不到；
+语音条 MaiBot 最多转成文字（要开 [voice] enable_asr），听不出唱得怎么样、是男声还是女声。
 这个插件：
-1. 收到音频文件消息就记下来，并趁下载链接还活着先存一份（QQ 的文件链接大约 13 小时就失效）；
+1. 收到音频文件或语音条就记下来，并先存一份（QQ 的文件链接大约 13 小时就失效）；
 2. 提供 listen_audio_file 工具，麦麦想听时自己调用；
 3. /听音频 命令方便手动测试。
 
@@ -13,6 +14,7 @@ QQ 端用 NapCat 或 SnowLuma 都行（MaiBot 官方的 NapCat 适配器、SnowL
 
 from __future__ import annotations
 
+import base64
 import html
 import logging
 import os
@@ -31,6 +33,7 @@ from .audio_core import (
     ask_model,
     fetch_bytes,
     is_audio_name,
+    sniff_audio_ext,
     to_small_mp3,
     to_wav,
 )
@@ -44,6 +47,7 @@ MSG_ID_RE = re.compile(r"-?\d+")
 # 适配器接口前缀：官方适配器（NapCat 版、SnowLuma 1.0 起的合并版）都认 adapter.napcat.*；
 # SnowLuma 适配器另有同义的 adapter.snowluma.*，前一个调不通时再试它
 ADAPTER_API_PREFIXES = ("adapter.napcat.", "adapter.snowluma.")
+VOICE_LABEL = "语音条"
 
 
 class PluginSection(PluginConfigBase):
@@ -58,7 +62,7 @@ class LLMSection(PluginConfigBase):
     )
     base_url: str = Field(
         default="https://dashscope.aliyuncs.com/compatible-mode/v1",
-        description="接口地址，一般不用改；百炼控制台给的调用地址不一样就填那个（以 /compatible-mode/v1 结尾）",
+        description="接口地址，一般不用改；百炼控制台给的调用地址不一样就填那个（以 /compatible-mode/v1 结尾）。Key 会发到这个地址，别填不可信的",
     )
     model: str = Field(default="qwen3.5-omni-flash", description="听音频用的模型；想更细可换 qwen3.5-omni-plus（更慢更贵）")
     timeout_seconds: int = Field(default=90, description="等模型回答最多几秒")
@@ -67,7 +71,10 @@ class LLMSection(PluginConfigBase):
 class ListenSection(PluginConfigBase):
     max_seconds: int = Field(default=600, description="最长听多少秒，超过的部分不听")
     max_file_mb: int = Field(default=40, description="文件大小上限（MB）")
-    cache_on_arrival: bool = Field(default=True, description="收到音频文件就先存一份（QQ 文件链接约 13 小时失效，群文件也常被删）")
+    include_voice: bool = Field(
+        default=True, description="也能听语音条（收到语音条会在本地存一份副本，留 keep_days 天）；关掉就只管音频文件",
+    )
+    cache_on_arrival: bool = Field(default=True, description="收到音频文件或语音条就先存一份（QQ 文件链接约 13 小时失效，群文件也常被删）")
     keep_days: int = Field(default=7, description="存的副本留几天")
     allow_private_network: bool = Field(
         default=False,
@@ -92,6 +99,24 @@ class AudioRecord:
     group_id: str = ""
     file_id: str = ""
     local_path: str = ""
+    kind: str = "file"  # file＝音频文件；voice＝语音条
+
+    @property
+    def label(self) -> str:
+        return VOICE_LABEL if self.kind == "voice" else f"音频文件「{self.name}」"
+
+
+def _voice_segment(message: dict[str, Any]) -> dict[str, Any] | None:
+    """消息里的语音段（适配器给的是 type=voice，带 binary_data_base64）。"""
+    for seg in message.get("raw_message") or []:
+        if isinstance(seg, dict) and seg.get("type") == "voice":
+            return seg
+    return None
+
+
+def _sender_of(message: dict[str, Any]) -> str:
+    user = (message.get("message_info") or {}).get("user_info") or {}
+    return str(user.get("user_cardname") or user.get("user_nickname") or user.get("user_id") or "对方")
 
 
 def _message_text(message: dict[str, Any]) -> str:
@@ -150,6 +175,11 @@ class ListenAudioFilePlugin(MaiBotPlugin):
         del kwargs
         if not isinstance(message, dict):
             return
+        voice = _voice_segment(message)
+        if voice is not None:
+            if self.config.listen.include_voice:
+                await self._remember_voice(message, voice)
+            return
         m = FILE_TEXT_RE.search(_message_text(message))
         if not m or not is_audio_name(m.group("name")):
             return
@@ -167,10 +197,47 @@ class ListenAudioFilePlugin(MaiBotPlugin):
         )
         if not await self._confirm_on_qq(rec):
             return
-        self.recent.setdefault(rec.stream_id, deque(maxlen=20)).append(rec)
+        self._remember(rec)
         logger.info(f"[听音频文件] 记下 {rec.sender} 发的「{rec.name}」 msg_id={rec.msg_id}")
         if self.config.listen.cache_on_arrival:
             await self._save_copy(rec)
+
+    def _remember(self, rec: AudioRecord) -> None:
+        self.recent.setdefault(rec.stream_id, deque(maxlen=50)).append(rec)
+
+    async def _remember_voice(self, message: dict[str, Any], seg: dict[str, Any]) -> None:
+        """语音条：音频就在消息里（适配器已经取好了），当场存一份；没带数据的等要听时再找 QQ 端要。"""
+        group = (message.get("message_info") or {}).get("group_info") or {}
+        rec = AudioRecord(
+            msg_id=str(message.get("message_id") or ""), name=VOICE_LABEL, url="",
+            sender=_sender_of(message), ts=time.time(),
+            stream_id=str(message.get("session_id") or ""), group_id=str(group.get("group_id") or ""),
+            kind="voice",
+        )
+        self._remember(rec)
+        logger.debug(f"[听音频文件] 记下 {rec.sender} 的语音条 msg_id={rec.msg_id}")
+        if self.config.listen.cache_on_arrival:
+            self._save_voice(rec, seg.get("binary_data_base64"))
+
+    def _save_voice(self, rec: AudioRecord, b64: Any) -> None:
+        if not b64:
+            return
+        try:
+            data = base64.b64decode(str(b64))
+            if not data or len(data) > self._max_bytes:
+                return
+            os.makedirs(self._cache_dir(), exist_ok=True)
+            path = os.path.join(self._cache_dir(), f"{self._safe_mid(rec.msg_id)}_voice{sniff_audio_ext(data) or '.bin'}")
+            with open(path, "wb") as f:
+                f.write(data)
+            rec.local_path = path
+        except Exception as exc:
+            logger.info(f"[听音频文件] 存语音条失败（不影响之后再取）：{exc}")
+        self._prune_cache()
+
+    @staticmethod
+    def _safe_mid(msg_id: str) -> str:
+        return re.sub(r"[^0-9-]", "", msg_id) or "x"
 
     async def _adapter_call(self, name: str, **kwargs: Any) -> Any:
         """调 QQ 适配器的接口（name 不带前缀，如 "message.get_msg"），两种前缀依次试。
@@ -231,7 +298,7 @@ class ListenAudioFilePlugin(MaiBotPlugin):
             data = await fetch_bytes(rec.url, self._max_bytes, allow_private=self.config.listen.allow_private_network)
             os.makedirs(self._cache_dir(), exist_ok=True)
             safe = re.sub(r"[^\w.\-]+", "_", rec.name)[-80:]
-            path = os.path.join(self._cache_dir(), f"{re.sub(r'[^0-9-]', '', rec.msg_id) or 'x'}_{safe}")
+            path = os.path.join(self._cache_dir(), f"{self._safe_mid(rec.msg_id)}_{safe}")
             with open(path, "wb") as f:
                 f.write(data)
             rec.local_path = path
@@ -257,16 +324,17 @@ class ListenAudioFilePlugin(MaiBotPlugin):
     @Tool(
         "listen_audio_file",
         description=(
-            "听聊天里别人发的音频文件（聊天里显示成「[文件] xxx.mp3，大小: …」这样的一行，m4a/wav/amr/flac 等也行；"
-            "文件不会自动听，要听就得调用这个工具）。有人发了音频文件、想让你听听里面是什么、或让你点评唱得怎么样时用。"
-            "填那条文件消息的 msg_id；不填就听这个聊天里最近的一个音频文件。"
+            "听聊天里别人发的音频文件（显示成「[文件] xxx.mp3，大小: …」这样的一行，m4a/wav/amr/flac 等也行）或语音条。"
+            "音频文件不会自动听；语音条最多自动转成文字，听不出唱得怎么样、是男声还是女声、语气如何。"
+            "有人发了音频、想让你听听里面是什么、或让你点评唱得怎么样时用。"
+            "最好填那条消息的 msg_id；不填就听这个聊天里最近的一个（音频文件和语音条都算）。"
         ),
         parameters=[
             ToolParameterInfo(
                 name="msg_id", param_type=ToolParamType.STRING, required=False,
                 description=(
-                    "那条「[文件] …」消息的 msg_id，只填那串数字（可能带负号，例如 -1592304852）；"
-                    "不填就听这个聊天最近的一个音频文件。想重点听什么写在 focus 里，别写在这里"
+                    "那条音频文件或语音条消息的 msg_id，只填那串数字（可能带负号，例如 -1592304852）；"
+                    "不填就听这个聊天最近的一个。想重点听什么写在 focus 里，别写在这里"
                 ),
             ),
             ToolParameterInfo(
@@ -295,9 +363,9 @@ class ListenAudioFilePlugin(MaiBotPlugin):
             logger.warning(f"[听音频文件] 出错：{type(exc).__name__}: {exc}")
             return {"name": "listen_audio_file", "content": "没听成（插件内部出错）。如实告诉对方你这次没听到，别编听感。"}
         if full:
-            head = f"（你刚听了 {rec.sender} 发的音频文件「{rec.name}」）"
+            head = f"（你刚听了 {rec.sender} 发的{rec.label}）"
         else:
-            head = (f"（你刚把 {rec.sender} 发的音频文件「{rec.name}」里的话转成了文字——"
+            head = (f"（你刚把 {rec.sender} 发的{rec.label}里的话转成了文字——"
                     "只有文字，听不出唱得怎么样、是男声还是女声）")
         return {
             "name": "listen_audio_file",
@@ -309,14 +377,15 @@ class ListenAudioFilePlugin(MaiBotPlugin):
         }
 
     # ---------- 3. 手动测试命令 ----------
-    @Command("listen_audio_test", description="手动测试：/听音频 [想重点听什么]，听这个聊天最近的一个音频文件",
+    @Command("listen_audio_test", description="手动测试：/听音频 [想重点听什么]，听这个聊天最近的一个音频文件或语音条",
              pattern=r"^/听音频(?:\s+(?P<focus>.+))?$")
     async def handle_listen_command(self, stream_id: str = "", **kwargs: Any):
         groups = kwargs.get("matched_groups") if isinstance(kwargs.get("matched_groups"), dict) else {}
         focus = str(groups.get("focus") or "").strip()
         try:
             rec, text, full = await self._listen(stream_id, "", focus)
-            reply = f"🎧 {rec.name}{'' if full else '（只转了文字）'}\n{text}"
+            title = f"{rec.sender} 的语音条" if rec.kind == "voice" else rec.name
+            reply = f"🎧 {title}{'' if full else '（只转了文字）'}\n{text}"
         except AudioError as exc:
             reply = f"没听成：{exc}"
         except Exception as exc:
@@ -335,27 +404,41 @@ class ListenAudioFilePlugin(MaiBotPlugin):
                 return r
         # 插件装上之前发的、或重启后名单清空了：去库里按 msg_id 找那条消息
         try:
-            res = await self.ctx.message.get_by_id(msg_id, stream_id=stream_id)
+            try:
+                res = await self.ctx.message.get_by_id(msg_id, stream_id=stream_id, include_binary_data=True)
+            except TypeError:  # 老版 SDK 没有 include_binary_data
+                res = await self.ctx.message.get_by_id(msg_id, stream_id=stream_id)
         except Exception as exc:
             logger.info(f"[听音频文件] 按 msg_id 查消息失败：{exc}")
             return None
         msg = res.get("message") if isinstance(res, dict) and isinstance(res.get("message"), dict) else res
         if not isinstance(msg, dict):
             return None
+        group = (msg.get("message_info") or {}).get("group_info") or {}
+        saved = [fn for fn in self._safe_listdir() if fn.startswith(f"{self._safe_mid(msg_id)}_")]
+        voice = _voice_segment(msg)
+        if voice is not None:
+            if not self.config.listen.include_voice:
+                return None
+            rec = AudioRecord(
+                msg_id=msg_id, name=VOICE_LABEL, url="", sender=_sender_of(msg), ts=time.time(),
+                stream_id=stream_id, group_id=str(group.get("group_id") or ""), kind="voice",
+            )
+            voice_saved = [fn for fn in saved if "_voice" in fn]
+            if voice_saved:
+                rec.local_path = os.path.join(self._cache_dir(), voice_saved[0])
+            else:
+                self._save_voice(rec, voice.get("binary_data_base64"))
+            return rec
         m = FILE_TEXT_RE.search(_message_text(msg))
         if not m or not is_audio_name(m.group("name")):
             return None
-        info = msg.get("message_info") or {}
-        user = info.get("user_info") or {}
-        group = info.get("group_info") or {}
         rec = AudioRecord(
             msg_id=msg_id, name=m.group("name"), url=m.group("url") or "",
-            sender=str(user.get("user_cardname") or user.get("user_nickname") or "对方"),
-            ts=time.time(), stream_id=stream_id, group_id=str(group.get("group_id") or ""),
+            sender=_sender_of(msg), ts=time.time(), stream_id=stream_id, group_id=str(group.get("group_id") or ""),
         )
         if not await self._confirm_on_qq(rec):
             return None
-        saved = [fn for fn in self._safe_listdir() if fn.startswith(f"{msg_id}_")]
         if saved:
             rec.local_path = os.path.join(self._cache_dir(), saved[0])
         return rec
@@ -366,7 +449,44 @@ class ListenAudioFilePlugin(MaiBotPlugin):
         except OSError:
             return []
 
+    async def _refetch_voice(self, rec: AudioRecord) -> bytes:
+        """没存到副本的语音条：到 QQ 端查原消息拿语音文件名，再让适配器把语音取回来（QQ 端只认最近几小时的消息）。"""
+        if not MSG_ID_RE.fullmatch(rec.msg_id):
+            raise AudioError("这条语音条没有存副本，也查不到原消息")
+        try:
+            detail = await self._adapter_call("message.get_msg", message_id=int(rec.msg_id))
+        except Exception as exc:
+            raise AudioError("这条语音条没有存副本，QQ 端也查不到原消息了（可能太久了）") from exc
+        segs = detail.get("message") if isinstance(detail, dict) else None
+        data = next((s.get("data") or {} for s in segs or [] if isinstance(s, dict) and s.get("type") == "record"), None)
+        if data is None:
+            raise AudioError("QQ 端查到的原消息里没有语音")
+        errors = []
+        try:
+            got = await self._adapter_call(
+                "file.get_record", file=str(data.get("file") or ""), file_id=str(data.get("file_id") or ""), out_format="mp3",
+            )
+            if isinstance(got, dict):
+                if got.get("base64"):
+                    return base64.b64decode(str(got["base64"]))
+                path = str(got.get("file") or "")
+                if path and os.path.isfile(path):
+                    return await fetch_bytes(path, self._max_bytes)
+        except Exception as exc:
+            errors.append(f"适配器取语音失败：{exc}")
+        url = str(data.get("url") or "")
+        if url.startswith(("http://", "https://")):
+            return await fetch_bytes(url, self._max_bytes, allow_private=self.config.listen.allow_private_network)
+        raise AudioError(errors[-1] if errors else "这条语音取不回来了")
+
     async def _get_bytes(self, rec: AudioRecord) -> bytes:
+        if rec.kind == "voice":
+            if rec.local_path:
+                try:
+                    return await fetch_bytes(rec.local_path, self._max_bytes)
+                except AudioError:
+                    pass
+            return await self._refetch_voice(rec)
         errors = []
         for src in (rec.local_path, rec.url):
             if not src:
@@ -392,12 +512,18 @@ class ListenAudioFilePlugin(MaiBotPlugin):
     async def _listen(self, stream_id: str, msg_id: str, focus: str) -> tuple[AudioRecord, str, bool]:
         rec = await self._find(stream_id, msg_id)
         if rec is None:
-            raise AudioError("没找到这个音频文件（插件装好之后发的才记得住；或者这条 msg_id 不是音频文件）")
+            raise AudioError("没找到这条音频（插件装好之后发的才记得住；或者这条 msg_id 不是音频文件或语音条）")
         raw = await self._get_bytes(rec)
+        fname = rec.name
+        if rec.kind == "voice":
+            ext = sniff_audio_ext(raw)
+            if ext == ".silk":
+                raise AudioError("这条语音是 QQ 原始的 silk 格式，转不了（适配器通常会先转成 mp3/wav，可能是适配器版本太旧）")
+            fname = f"voice{ext}"
         cfg = self.config
         api_key = str(cfg.llm.api_key or "").strip()
         if api_key:
-            audio, fmt = await to_small_mp3(raw, rec.name, int(cfg.listen.max_seconds))
+            audio, fmt = await to_small_mp3(raw, fname, int(cfg.listen.max_seconds))
             prompt = DEFAULT_PROMPT
             if focus:
                 prompt = (
@@ -410,7 +536,7 @@ class ListenAudioFilePlugin(MaiBotPlugin):
             )
             return rec, text, True
         # 没填 key：用 MaiBot 自己配的语音识别模型（只能转文字）
-        wav = await to_wav(raw, rec.name, int(cfg.listen.max_seconds))
+        wav = await to_wav(raw, fname, int(cfg.listen.max_seconds))
         res = await self.ctx.llm.transcribe_audio(wav, task_name="voice")
         text = str((res or {}).get("text") or (res or {}).get("content") or "").strip() if isinstance(res, dict) else str(res or "")
         if not text:

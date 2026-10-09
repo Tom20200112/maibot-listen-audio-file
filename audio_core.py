@@ -16,6 +16,8 @@ import tempfile
 from urllib.parse import urljoin, urlsplit
 
 import aiohttp
+from aiohttp import ThreadedResolver
+from aiohttp.abc import AbstractResolver
 
 AUDIO_EXTS = (
     ".m4a", ".mp3", ".wav", ".amr", ".aac", ".ogg", ".opus", ".flac",
@@ -55,6 +57,13 @@ def _ext(name: str) -> str:
     return ext if ext in AUDIO_EXTS else ""
 
 
+def _is_public_ip(addr: str) -> bool:
+    ip = ipaddress.ip_address(str(addr).split("%", 1)[0])
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    return ip.is_global and not ip.is_multicast
+
+
 async def check_public_url(url: str) -> None:
     """只允许下载公网地址：防止有人伪造文件消息，让 bot 去访问本机、内网或云服务器元数据地址。"""
     parts = urlsplit(url)
@@ -65,12 +74,24 @@ async def check_public_url(url: str) -> None:
         infos = await asyncio.get_running_loop().getaddrinfo(parts.hostname, port, type=socket.SOCK_STREAM)
     except (socket.gaierror, UnicodeError) as exc:
         raise AudioError(f"文件链接的域名解析失败（{parts.hostname}）") from exc
-    for info in infos:
-        ip = ipaddress.ip_address(str(info[4][0]).split("%", 1)[0])
-        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
-            ip = ip.ipv4_mapped
-        if not ip.is_global or ip.is_multicast:
-            raise AudioError("文件链接指向本机或内网地址，出于安全不下载")
+    if not all(_is_public_ip(info[4][0]) for info in infos):
+        raise AudioError("文件链接指向本机或内网地址，出于安全不下载")
+
+
+class PublicOnlyResolver(AbstractResolver):
+    """真正连接时用的就是检查过的地址：防止「检查时解析到公网、连接时又解析到内网」的 DNS 重绑定。"""
+
+    def __init__(self) -> None:
+        self._inner = ThreadedResolver()
+
+    async def resolve(self, host: str, port: int = 0, family: int = socket.AF_INET):  # type: ignore[override]
+        infos = await self._inner.resolve(host, port, family)
+        if not infos or not all(_is_public_ip(info["host"]) for info in infos):
+            raise OSError(f"{host} 解析到了本机或内网地址")
+        return infos
+
+    async def close(self) -> None:
+        await self._inner.close()
 
 
 async def fetch_bytes(src: str, max_bytes: int, timeout: float = 120.0, allow_private: bool = False) -> bytes:
@@ -88,23 +109,29 @@ async def fetch_bytes(src: str, max_bytes: int, timeout: float = 120.0, allow_pr
     if src.startswith(("http://", "https://")):
         url = src
         data = None
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
-            for _ in range(_MAX_REDIRECTS + 1):
-                if not allow_private:
-                    await check_public_url(url)
-                async with session.get(url, headers={"User-Agent": "Mozilla/5.0"}, allow_redirects=False) as resp:
-                    if resp.status in (301, 302, 303, 307, 308) and resp.headers.get("Location"):
-                        url = urljoin(url, resp.headers["Location"])
-                        continue
-                    if resp.status != 200:
-                        raise AudioError(f"下载音频失败（HTTP {resp.status}，文件链接可能已经过期）")
-                    buf = bytearray()
-                    async for chunk in resp.content.iter_chunked(64 * 1024):
-                        buf.extend(chunk)
-                        if len(buf) > max_bytes:
-                            break
-                    data = bytes(buf)
-                    break
+        connector = None if allow_private else aiohttp.TCPConnector(resolver=PublicOnlyResolver())
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout), connector=connector) as session:
+                for _ in range(_MAX_REDIRECTS + 1):
+                    if not allow_private:
+                        await check_public_url(url)  # 先查一遍给出明白的提示；连接时 PublicOnlyResolver 再把关
+                    async with session.get(url, headers={"User-Agent": "Mozilla/5.0"}, allow_redirects=False) as resp:
+                        if resp.status in (301, 302, 303, 307, 308) and resp.headers.get("Location"):
+                            url = urljoin(url, resp.headers["Location"])
+                            continue
+                        if resp.status != 200:
+                            raise AudioError(f"下载音频失败（HTTP {resp.status}，文件链接可能已经过期）")
+                        buf = bytearray()
+                        async for chunk in resp.content.iter_chunked(64 * 1024):
+                            buf.extend(chunk)
+                            if len(buf) > max_bytes:
+                                break
+                        data = bytes(buf)
+                        break
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            if "本机或内网" in str(exc):
+                raise AudioError("文件链接指向本机或内网地址，出于安全不下载") from exc
+            raise AudioError(f"下载音频失败（网络错误：{type(exc).__name__}）") from exc
         if data is None:
             raise AudioError("文件链接跳转次数太多")
     elif os.path.isfile(src):
@@ -115,6 +142,26 @@ async def fetch_bytes(src: str, max_bytes: int, timeout: float = 120.0, allow_pr
     if len(data) > max_bytes:
         raise AudioError(f"音频文件太大（超过 {max_bytes // 1024 // 1024}MB）")
     return data
+
+
+def sniff_audio_ext(data: bytes) -> str:
+    """按文件头认音频格式（语音条没有文件名）。认不出返回空串。"""
+    head = bytes(data[:16])
+    if head[:4] == b"RIFF" and head[8:12] == b"WAVE":
+        return ".wav"
+    if b"#!SILK" in head[:10]:
+        return ".silk"
+    if head[:5] == b"#!AMR":
+        return ".amr"
+    if head[:4] == b"OggS":
+        return ".ogg"
+    if head[:4] == b"fLaC":
+        return ".flac"
+    if head[4:8] == b"ftyp":
+        return ".m4a"
+    if head[:3] == b"ID3" or (len(head) > 1 and head[0] == 0xFF and (head[1] & 0xE0) == 0xE0):
+        return ".mp3"
+    return ""
 
 
 def ffmpeg_available() -> bool:

@@ -1,0 +1,39 @@
+{
+  "manifest_version": 2,
+  "version": "1.0.2",
+  "name": "听音频文件",
+  "description": "让麦麦能听聊天里发的音频文件（mp3/m4a/wav 等）：听写歌词、点评唱歌、说出内容",
+  "author": {
+    "name": "Tom",
+    "url": "https://github.com/Tom20200112"
+  },
+  "license": "MIT",
+  "urls": {
+    "repository": "https://github.com/Tom20200112/maibot-listen-audio-file",
+    "homepage": "https://github.com/Tom20200112/maibot-listen-audio-file",
+    "documentation": "https://github.com/Tom20200112/maibot-listen-audio-file/blob/main/README.md",
+    "issues": "https://github.com/Tom20200112/maibot-listen-audio-file/issues"
+  },
+  "host_application": {
+    "min_version": "1.2.0",
+    "max_version": "1.3.99"
+  },
+  "sdk": {
+    "min_version": "2.7.1",
+    "max_version": "2.99.99"
+  },
+  "dependencies": [],
+  "capabilities": [
+    "api.call",
+    "message.get_by_id",
+    "llm.transcribe_audio",
+    "send.text"
+  ],
+  "i18n": {
+    "default_locale": "zh-CN",
+    "supported_locales": [
+      "zh-CN"
+    ]
+  },
+  "id": "tom.listen-audio-file"
+}

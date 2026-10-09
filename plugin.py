@@ -74,7 +74,10 @@ class ListenSection(PluginConfigBase):
     include_voice: bool = Field(
         default=True, description="也能听语音条（收到语音条会在本地存一份副本，留 keep_days 天）；关掉就只管音频文件",
     )
-    cache_on_arrival: bool = Field(default=True, description="收到音频文件或语音条就先存一份（QQ 文件链接约 13 小时失效，群文件也常被删）")
+    cache_on_arrival: bool = Field(
+        default=True,
+        description="收到音频文件或语音条就先存一份。QQ 文件链接约 13 小时就失效、群文件也常被删；语音条的音频 MaiBot 不长期保存，不存的话只能趁 QQ 端还查得到时重取",
+    )
     keep_days: int = Field(default=7, description="存的副本留几天")
     allow_private_network: bool = Field(
         default=False,
@@ -324,7 +327,8 @@ class ListenAudioFilePlugin(MaiBotPlugin):
     @Tool(
         "listen_audio_file",
         description=(
-            "听聊天里别人发的音频文件（显示成「[文件] xxx.mp3，大小: …」这样的一行，m4a/wav/amr/flac 等也行）或语音条。"
+            "听聊天里别人发的音频文件或语音条。"
+            "音频文件在聊天里显示成「[文件] xxx.mp3，大小: …」这样的一行，m4a、wav、amr、flac 等格式都行。"
             "音频文件不会自动听；语音条最多自动转成文字，听不出唱得怎么样、是男声还是女声、语气如何。"
             "有人发了音频、想让你听听里面是什么、或让你点评唱得怎么样时用。"
             "最好填那条消息的 msg_id；不填就听这个聊天里最近的一个（音频文件和语音条都算）。"
@@ -456,7 +460,7 @@ class ListenAudioFilePlugin(MaiBotPlugin):
         try:
             detail = await self._adapter_call("message.get_msg", message_id=int(rec.msg_id))
         except Exception as exc:
-            raise AudioError("这条语音条没有存副本，QQ 端也查不到原消息了（可能太久了）") from exc
+            raise AudioError("这条语音条没有存副本，QQ 端也查不到原消息了，可能是发得太久了") from exc
         segs = detail.get("message") if isinstance(detail, dict) else None
         data = next((s.get("data") or {} for s in segs or [] if isinstance(s, dict) and s.get("type") == "record"), None)
         if data is None:
@@ -508,18 +512,18 @@ class ListenAudioFilePlugin(MaiBotPlugin):
                 errors.append("群文件重取没拿到下载地址")
             except Exception as exc:
                 errors.append(f"群文件重取失败：{exc}")
-        raise AudioError(errors[-1] if errors else "拿不到这个文件（可能已被删除或过期）")
+        raise AudioError(errors[-1] if errors else "拿不到这个文件，可能已被删除或过期")
 
     async def _listen(self, stream_id: str, msg_id: str, focus: str) -> tuple[AudioRecord, str, bool]:
         rec = await self._find(stream_id, msg_id)
         if rec is None:
-            raise AudioError("没找到这条音频（插件装好之后发的才记得住；或者这条 msg_id 不是音频文件或语音条）")
+            raise AudioError("没找到这条音频。可能是插件装好之前发的，也可能这条 msg_id 不是音频文件或语音条")
         raw = await self._get_bytes(rec)
         fname = rec.name
         if rec.kind == "voice":
             ext = sniff_audio_ext(raw)
             if ext == ".silk":
-                raise AudioError("这条语音是 QQ 原始的 silk 格式，转不了（适配器通常会先转成 mp3/wav，可能是适配器版本太旧）")
+                raise AudioError("这条语音还是 QQ 原始的 silk 格式，插件转不了。适配器通常会先把语音转成 mp3 或 wav，可能是适配器版本太旧")
             fname = f"voice{ext}"
         cfg = self.config
         api_key = str(cfg.llm.api_key or "").strip()

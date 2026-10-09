@@ -502,9 +502,10 @@ class ListenAudioFilePlugin(MaiBotPlugin):
                     "file.get_group_file_url",
                     params={"group_id": int(rec.group_id), "file_id": rec.file_id, "busid": 102},
                 )
-                url = ret.get("url") if isinstance(ret, dict) else None
-                if url:
+                url = str(ret.get("url") or "") if isinstance(ret, dict) else ""
+                if url.startswith(("http://", "https://")):  # 只认网址，免得适配器返回怪东西时去读本机文件
                     return await fetch_bytes(url, self._max_bytes, allow_private=self.config.listen.allow_private_network)
+                errors.append("群文件重取没拿到下载地址")
             except Exception as exc:
                 errors.append(f"群文件重取失败：{exc}")
         raise AudioError(errors[-1] if errors else "拿不到这个文件（可能已被删除或过期）")
